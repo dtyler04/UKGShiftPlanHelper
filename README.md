@@ -2,7 +2,8 @@
 Helps export select Users shift plans and calculates whether they need a break, thus giving you a break
 
 Steps:
-##1. Install Tampermonkey
+
+## 1. Install Tampermonkey
 ### Edge
 https://microsoftedge.microsoft.com/addons/detail/iikmkjmpaadaobahmlepeloendndfphd
 ### Chrome
