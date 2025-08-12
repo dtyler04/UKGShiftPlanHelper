@@ -1,7 +1,7 @@
 # UKGShiftPlanHelper
 Helps export select Users shift plans and calculates whether they need a break, thus giving you a break
 
-Steps:
+Steps: 
 
 ## 1. Install Tampermonkey
 ### Edge
@@ -14,7 +14,7 @@ https://chromewebstore.google.com/detail/dhdgffkkebhmkfjojejmpbldmpobfkfo
 Go to: Location Schedule
 
 ## 3. You will be asked for which day you want to download the data for
-<img width="1919" height="1153" alt="image" src="https://github.com/user-attachments/assets/f742659d-c494-4aba-a06d-f012115f6765" />
+<img width="1919" height="1153" alt="image showing the prompted selector for days of the week" src="https://github.com/user-attachments/assets/f742659d-c494-4aba-a06d-f012115f6765" />
 
 ## 4. The data will be all nicely exported, and downloaded as a spreadsheet
-<img width="529" height="615" alt="image" src="https://github.com/user-attachments/assets/226be434-01a0-4007-b0c4-ce969ade2f1f" />
+<img width="529" height="615" alt="image showing spreadsheet with names blocked out for privacy reasons" src="https://github.com/user-attachments/assets/226be434-01a0-4007-b0c4-ce969ade2f1f" />
