@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         UKG getScheduleForEmployeeList -> CSV (date picker + break flag + Day label, strict shifts)
+// @name         UKG getScheduleForEmployeeList -> CSV (date picker, break flag, re-prompt on new week)
 // @namespace    darcy.ukg.capture
-// @version      1.3.1
-// @description  Intercept UKG WS, show a 7-day picker, export CSV with Day+Break Required; stricter shift detection
+// @version      1.4.0
+// @description  Intercept UKG WS, show a date picker (up to 7 days), export CSV with Day + Break Required; auto re-prompt on new data
 // @match        https://endeavourgroup-sso.prd.mykronos.com/*
 // @run-at       document-start
 // @inject-into  page
@@ -14,10 +14,13 @@
   const BRIDGE_EVENT = "tm-ukg-ws-capture";
   const hasGMDownload = typeof GM_download === "function";
 
-  let uiShown = false;
+  // State
   let currentShifts = [];
   let currentEmpMap = new Map();
+  let overlayRef = null;         // overlay DOM element if visible
+  let currentDatesKey = "";      // joined dates string to detect change
 
+  // Listen for the matching WS payload
   window.addEventListener(BRIDGE_EVENT, (e) => {
     try {
       const { rawMessage } = e.detail || {};
@@ -32,7 +35,7 @@
 
       const empMap = buildEmployeeMap(roots);
 
-      // Build up to 7 unique local dates from shifts
+      // Unique local dates (from start/end) limited to 7
       const dateSet = new Set();
       for (const sh of allShifts) {
         const s = toDate(sh.startDateTime);
@@ -43,22 +46,37 @@
       const dates = Array.from(dateSet).sort().slice(0, 7);
       if (!dates.length) return;
 
+      // If dates changed (e.g., user clicked "Next week"), reprompt/update
+      const newKey = dates.join("|");
+      const datesChanged = newKey !== currentDatesKey;
+
+      // Update state
       currentShifts = allShifts;
       currentEmpMap = empMap;
 
-      if (!uiShown) {
-        uiShown = true;
-        showDatePicker(dates, (picked) => exportCSVForDate(picked));
+      if (datesChanged) {
+        currentDatesKey = newKey;
+        if (overlayRef) {
+          // Update the existing picker with new dates
+          updateDatePicker(overlayRef, dates, (picked) => exportCSVForDate(picked));
+        } else {
+          // Show a fresh picker
+          overlayRef = showDatePicker(dates, (picked) => {
+            closeOverlay();
+            exportCSVForDate(picked);
+          });
+        }
       }
     } catch (err) {
       console.warn("[UKG] WS parse error:", err);
     }
   });
 
+  // -------- CSV export for a chosen date --------
   function exportCSVForDate(targetYMD) {
     if (!currentShifts.length) return;
 
-    const dayLabel = formatDayLabel(fromYMD(targetYMD));
+    const dayLabel = formatDayLabel(fromYMD(targetYMD)); // e.g., "Monday 11/08/2025"
     const rows = [["Day","EmployeeID","Employee Name","Shift Start","Shift End","Break Required"]];
 
     for (const sh of currentShifts) {
@@ -66,11 +84,12 @@
       const end   = toDate(sh.endDateTime);
       if (!start || !end) continue;
 
-      // Include if either start OR end falls on chosen date (local)
+      // Include if either start OR end is on the chosen date (local)
       if (ymdLocal(start) !== targetYMD && ymdLocal(end) !== targetYMD) continue;
 
-      const empId = (sh.employee && (sh.employee.qualifier || sh.employee.id)) || "";
-      if (!empId) continue; // extra guard: ignore any item without an employee
+      const empId =
+        (sh.employee && (sh.employee.qualifier || sh.employee.id)) || "";
+      if (!empId) continue; // extra guard
 
       const name =
         (sh.employee && (currentEmpMap.get(String(sh.employee.qualifier)) ||
@@ -79,7 +98,14 @@
       const hours = durationHours(start, end);
       const breakRequired = hours > 6 ? "Yes" : "No";
 
-      rows.push([dayLabel, String(empId), String(name), timeHM(start), timeHM(end), breakRequired]);
+      rows.push([
+        dayLabel,
+        String(empId),
+        String(name),
+        timeHM(start),
+        timeHM(end),
+        breakRequired
+      ]);
     }
 
     if (rows.length === 1) {
@@ -87,7 +113,7 @@
       return;
     }
 
-    // Sort by Shift Start (HH:MM)
+    // Sort by start time (HH:MM)
     rows.splice(1, rows.length-1, ...rows.slice(1).sort((a,b)=>a[3].localeCompare(b[3])));
 
     const csv = rows.map(r => r.map(escapeCsv).join(",")).join("\r\n");
@@ -111,101 +137,50 @@
     console.log(`[UKG] CSV exported: ${filename}`);
   }
 
-  // ---------- Shift collection (stricter) ----------
-  function collectShifts(roots){
-    const out = [];
-    for (const root of roots) {
-      for (const node of walk(root)) {
-        if (!node || typeof node !== "object") continue;
-
-        // Only scan known/likely containers
-        const containers = [];
-        if (Array.isArray(node.shifts)) containers.push(node.shifts);
-        if (Array.isArray(node.employeeShifts)) containers.push(node.employeeShifts);
-        if (Array.isArray(node.scheduleItems)) containers.push(node.scheduleItems);
-
-        for (const arr of containers) {
-          for (const sh of arr) {
-            const n = normalizeShift(sh);
-            if (n) out.push(n);
-          }
-        }
-      }
-    }
-
-    // Dedup by employee + times (handles duplicates in multiple subtrees)
-    const seen = new Set();
-    const dedup = [];
-    for (const s of out) {
-      const k = `${s.employee?.id ?? ""}|${s.employee?.qualifier ?? ""}|${s.startDateTime}|${s.endDateTime}`;
-      if (!seen.has(k)) { seen.add(k); dedup.push(s); }
-    }
-    return dedup;
-  }
-
-  function normalizeShift(sh){
-    if (!sh || typeof sh !== "object") return null;
-
-    // Reject known non-shift types
-    const kind = String(sh.itemType || sh.type || sh.category || sh.shiftType || "").toUpperCase();
-    if (/(BREAK|MEAL|TIME\s*OFF|AVAIL)/.test(kind)) return null;
-    if (sh.isOpenShift === true || sh.openShift === true || sh.isOpen === true || sh.open === true) return null;
-
-    // Start/End
-    const start = sh.startDateTime ?? sh.startTime ?? sh.start ?? sh.startDate ?? null;
-    const end   = sh.endDateTime   ?? sh.endTime   ?? sh.end   ?? sh.endDate   ?? null;
-    if (!start || !end) return null;
-
-    // Must have an employee reference
-    const empRef = sh.employee ?? sh.employeeRef ?? sh.owner?.employeeRef ?? null;
-    const employee = empRef ? {
-      id:        empRef.id ?? empRef.employeeId ?? empRef.personId ?? sh.employeeId ?? sh.personId ?? null,
-      qualifier: empRef.qualifier ?? sh.employeeNumber ?? null
-    } : null;
-
-    if (!employee || (employee.id == null && employee.qualifier == null)) return null;
-
-    return { id: sh.id ?? sh.shiftId ?? null, startDateTime: start, endDateTime: end, employee };
-  }
-
-  // ---------- Date picker UI (unchanged) ----------
+  // -------- Date picker UI --------
   function showDatePicker(dates, onPick) {
     const overlay = document.createElement("div");
+    overlay.id = "ukg-date-picker";
     Object.assign(overlay.style, {
-      position: "fixed", inset: "0", background: "rgba(0,0,0,0.35)",
-      zIndex: 2147483647, display: "flex", alignItems: "center", justifyContent: "center",
+      position: "fixed",
+      inset: "0",
+      background: "rgba(0,0,0,0.35)",
+      zIndex: 2147483647,
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
       fontFamily: "system-ui, sans-serif",
     });
 
     const panel = document.createElement("div");
     Object.assign(panel.style, {
-      background: "#fff", borderRadius: "14px", minWidth: "320px", maxWidth: "90vw",
-      padding: "16px", boxShadow: "0 12px 30px rgba(0,0,0,0.25)",
+      background: "#fff",
+      borderRadius: "14px",
+      minWidth: "320px",
+      maxWidth: "90vw",
+      padding: "16px",
+      boxShadow: "0 12px 30px rgba(0,0,0,0.25)",
     });
 
     const title = document.createElement("div");
     title.textContent = "Select a date to export";
-    Object.assign(title.style, { fontSize: "16px", fontWeight: "600", marginBottom: "10px" });
+    Object.assign(title.style, {
+      fontSize: "16px",
+      fontWeight: "600",
+      marginBottom: "10px",
+    });
 
     const grid = document.createElement("div");
+    grid.id = "ukg-date-grid";
     Object.assign(grid.style, {
-      display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px",
-      marginTop: "8px", marginBottom: "10px",
+      display: "grid",
+      gridTemplateColumns: "1fr 1fr",
+      gap: "8px",
+      marginTop: "8px",
+      marginBottom: "10px",
     });
 
-    dates.forEach(d => {
-      const label = formatDayLabel(fromYMD(d));
-      const btn = document.createElement("button");
-      btn.textContent = label;
-      Object.assign(btn.style, {
-        padding: "10px 12px", borderRadius: "10px", border: "1px solid #ccc",
-        background: "#f9f9f9", cursor: "pointer", fontSize: "13px", textAlign: "left",
-      });
-      btn.addEventListener("mouseenter", () => btn.style.background = "#f1f1f1");
-      btn.addEventListener("mouseleave", () => btn.style.background = "#f9f9f9");
-      btn.addEventListener("click", () => { document.body.removeChild(overlay); onPick(d); });
-      grid.appendChild(btn);
-    });
+    fillGridWithDates(grid, dates, onPick);
 
     const actions = document.createElement("div");
     actions.style.textAlign = "right";
@@ -213,10 +188,14 @@
     const cancel = document.createElement("button");
     cancel.textContent = "Cancel";
     Object.assign(cancel.style, {
-      padding: "8px 12px", borderRadius: "8px", border: "1px solid #ccc",
-      background: "#fff", cursor: "pointer", fontSize: "12px",
+      padding: "8px 12px",
+      borderRadius: "8px",
+      border: "1px solid #ccc",
+      background: "#fff",
+      cursor: "pointer",
+      fontSize: "12px",
     });
-    cancel.addEventListener("click", () => { document.body.removeChild(overlay); });
+    cancel.addEventListener("click", () => { closeOverlay(); });
 
     actions.appendChild(cancel);
     panel.appendChild(title);
@@ -225,23 +204,62 @@
     overlay.appendChild(panel);
     document.body.appendChild(overlay);
 
+    // ESC closes
     const onKey = (e) => {
-      if (e.key === "Escape") {
-        document.body.contains(overlay) && document.body.removeChild(overlay);
-        window.removeEventListener("keydown", onKey, true);
-      }
+      if (e.key === "Escape") closeOverlay();
     };
     window.addEventListener("keydown", onKey, true);
+    overlay._onKey = onKey; // remember listener for cleanup
+    overlay._grid = grid;   // save grid ref for updates
+
+    return overlay;
   }
 
-  // ---------- Utilities ----------
+  function updateDatePicker(overlay, dates, onPick) {
+    if (!overlay || !overlay._grid) return;
+    fillGridWithDates(overlay._grid, dates, onPick);
+  }
+
+  function fillGridWithDates(gridEl, dates, onPick) {
+    gridEl.innerHTML = "";
+    dates.forEach(d => {
+      const label = formatDayLabel(fromYMD(d));
+      const btn = document.createElement("button");
+      btn.textContent = label;
+      Object.assign(btn.style, {
+        padding: "10px 12px",
+        borderRadius: "10px",
+        border: "1px solid #ccc",
+        background: "#f9f9f9",
+        cursor: "pointer",
+        fontSize: "13px",
+        textAlign: "left",
+      });
+      btn.addEventListener("mouseenter", () => btn.style.background = "#f1f1f1");
+      btn.addEventListener("mouseleave", () => btn.style.background = "#f9f9f9");
+      btn.addEventListener("click", () => {
+        onPick(d);
+      });
+      gridEl.appendChild(btn);
+    });
+  }
+
+  function closeOverlay() {
+    if (!overlayRef) return;
+    const onKey = overlayRef._onKey;
+    if (onKey) window.removeEventListener("keydown", onKey, true);
+    if (document.body.contains(overlayRef)) document.body.removeChild(overlayRef);
+    overlayRef = null;
+  }
+
+  // -------- Helpers --------
   function safeStr(v){ return v == null ? "" : String(v); }
   function escapeCsv(v){ const s=safeStr(v); return /[",\n]/.test(s)?`"${s.replace(/"/g,'""')}"`:s; }
 
   function extractJsonCandidates(text){
     const out = [];
     if (!text) return out;
-    // SockJS frames: a["..."]
+    // SockJS array frames: a["...","..."]
     if (text[0] === "a") {
       try {
         const arr = JSON.parse(text.slice(1));
@@ -263,6 +281,63 @@
     yield obj;
     if (Array.isArray(obj)) for (const v of obj) yield* walk(v);
     else for (const k of Object.keys(obj)) yield* walk(obj[k]);
+  }
+
+  // ---------- Strict shift collection ----------
+  function collectShifts(roots){
+    const out = [];
+    for (const root of roots) {
+      for (const node of walk(root)) {
+        if (!node || typeof node !== "object") continue;
+
+        // Only likely containers
+        const containers = [];
+        if (Array.isArray(node.shifts)) containers.push(node.shifts);
+        if (Array.isArray(node.employeeShifts)) containers.push(node.employeeShifts);
+        if (Array.isArray(node.scheduleItems)) containers.push(node.scheduleItems);
+
+        for (const arr of containers) {
+          for (const sh of arr) {
+            const n = normalizeShift(sh);
+            if (n) out.push(n);
+          }
+        }
+      }
+    }
+
+    // Dedup by employee + times
+    const seen = new Set();
+    const dedup = [];
+    for (const s of out) {
+      const k = `${s.employee?.id ?? ""}|${s.employee?.qualifier ?? ""}|${s.startDateTime}|${s.endDateTime}`;
+      if (!seen.has(k)) { seen.add(k); dedup.push(s); }
+    }
+    return dedup;
+  }
+
+  function normalizeShift(sh){
+    if (!sh || typeof sh !== "object") return null;
+
+    // Reject non-shift types
+    const kind = String(sh.itemType || sh.type || sh.category || sh.shiftType || "").toUpperCase();
+    if (/(BREAK|MEAL|TIME\s*OFF|AVAIL)/.test(kind)) return null;
+    if (sh.isOpenShift === true || sh.openShift === true || sh.isOpen === true || sh.open === true) return null;
+
+    // Start/End
+    const start = sh.startDateTime ?? sh.startTime ?? sh.start ?? sh.startDate ?? null;
+    const end   = sh.endDateTime   ?? sh.endTime   ?? sh.end   ?? sh.endDate   ?? null;
+    if (!start || !end) return null;
+
+    // Must have employee ref
+    const empRef = sh.employee ?? sh.employeeRef ?? sh.owner?.employeeRef ?? null;
+    const employee = empRef ? {
+      id:        empRef.id ?? empRef.employeeId ?? empRef.personId ?? sh.employeeId ?? sh.personId ?? null,
+      qualifier: empRef.qualifier ?? sh.employeeNumber ?? null
+    } : null;
+
+    if (!employee || (employee.id == null && employee.qualifier == null)) return null;
+
+    return { id: sh.id ?? sh.shiftId ?? null, startDateTime: start, endDateTime: end, employee };
   }
 
   function buildEmployeeMap(roots){
@@ -292,6 +367,7 @@
     }
   }
 
+  // ---------- Date/time utils ----------
   function toDate(v){
     try {
       if (v == null) return null;
@@ -316,7 +392,7 @@
   function fromYMD(ymd){
     const [y,m,d]=ymd.split("-").map(n=>parseInt(n,10));
     return new Date(y, m-1, d);
-    }
+  }
   function timeHM(d){
     const pad=(n)=>String(n).padStart(2,"0");
     return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
@@ -327,12 +403,13 @@
     return ms / 3600000;
   }
   function formatDayLabel(dateObj){
+    // "Monday 11/08/2025" in local time
     const weekday = dateObj.toLocaleDateString("en-AU", { weekday: "long" });
     const ddmmyyyy = dateObj.toLocaleDateString("en-AU", { day: "2-digit", month: "2-digit", year: "numeric" });
     return `${weekday} ${ddmmyyyy}`;
   }
 
-  // -------- Inject WS wrapper --------
+  // -------- Inject page-context WS wrapper --------
   const inject = () => {
     const script = document.createElement("script");
     script.textContent = `
